@@ -1,20 +1,21 @@
 #include <jni.h>
 #include <dlfcn.h>
+#include <link.h>
+#include <sys/mman.h>
 #include <EGL/egl.h>
 #include <GLES2/gl2.h>
 #include <pthread.h>
 #include <unistd.h>
 #include <vector>
 #include <cstdlib>
+#include <cstring>
 #include <cmath>
 #include "imgui.h"
 #include "imgui_impl_opengl3.h"
-#include "dobby.h"
 
 struct Vec3 { float x, y, z; };
 struct Color { float r, g, b, a; };
 
-// Переменные настроек Mod Menu
 static bool showMenu = true;
 static bool enableStretch = true;
 static float aspectRatio = 1.333f;
@@ -26,20 +27,19 @@ static float timeScale = 1.0f;
 static float gravityY = -9.81f;
 static bool customGravity = false;
 
-static int weatherMode = 1; // 0-нет, 1-дождь, 2-снег, 3-искры
+static int weatherMode = 1;
 static int particleCount = 150;
 static float particleSpeed = 14.0f;
 static bool customFog = false;
-static float fogColor = {0.06f, 0.07f, 0.12f, 1.0f};
+static float fogColor[4] = {0.06f, 0.07f, 0.12f, 1.0f};
 static float fogDensity = 0.02f;
-static float screenTint = {0.0f, 0.0f, 0.0f, 0.0f};
+static float screenTint[4] = {0.0f, 0.0f, 0.0f, 0.0f};
 static bool showFps = true;
 static bool showDot = false;
 
 struct Particle { float x, y, l, s, phase; };
 static std::vector<Particle> parts;
 
-// Указатели на встроенные функции Unity (работают без дампа)
 typedef void* (*il2cpp_resolve_icall_t)(const char*);
 typedef void* (*Camera_get_main_t)();
 typedef void (*Camera_set_aspect_t)(void*, float);
@@ -60,7 +60,46 @@ static Application_set_targetFrameRate_t set_fps = nullptr;
 static RenderSettings_set_fog_t set_fog = nullptr;
 static RenderSettings_set_fogColor_t set_fogColor = nullptr;
 static RenderSettings_set_fogDensity_t set_fogDensity = nullptr;
-EGLBoolean (*orig_eglSwapBuffers)(EGLDisplay dpy, EGLSurface surface);
+
+// Встроенный PLT-хук (без сторонних библиотек)
+static void* orig_eglSwapBuffers_ptr = nullptr;
+struct HookData { const char* name; void* hook_fn; void** orig_fn; };
+
+static int phdr_cb(struct dl_phdr_info* info, size_t, void* data) {
+    auto* hd = (HookData*)data;
+    if (!info->dlpi_name || !strstr(info->dlpi_name, "libunity.so")) return 0;
+    ElfW(Dyn)* dyn = nullptr;
+    for (int i = 0; i < info->dlpi_phnum; i++) {
+        if (info->dlpi_phdr[i].p_type == PT_DYNAMIC) {
+            dyn = (ElfW(Dyn)*)(info->dlpi_addr + info->dlpi_phdr[i].p_vaddr);
+            break;
+        }
+    }
+    if (!dyn) return 0;
+    ElfW(Sym)* symtab = nullptr;
+    const char* strtab = nullptr;
+    ElfW(Rela)* jmprel = nullptr;
+    size_t pltrelsz = 0;
+    for (; dyn->d_tag != DT_NULL; dyn++) {
+        if (dyn->d_tag == DT_SYMTAB) symtab = (ElfW(Sym)*)(info->dlpi_addr + dyn->d_un.d_ptr);
+        else if (dyn->d_tag == DT_STRTAB) strtab = (const char*)(info->dlpi_addr + dyn->d_un.d_ptr);
+        else if (dyn->d_tag == DT_JMPREL) jmprel = (ElfW(Rela)*)(info->dlpi_addr + dyn->d_un.d_ptr);
+        else if (dyn->d_tag == DT_PLTRELSZ) pltrelsz = dyn->d_un.d_val;
+    }
+    if (!symtab || !strtab || !jmprel) return 0;
+    for (size_t i = 0; i < pltrelsz / sizeof(ElfW(Rela)); i++) {
+        size_t idx = ELF64_R_SYM(jmprel[i].r_info);
+        if (strcmp(strtab + symtab[idx].st_name, hd->name) == 0) {
+            void** got = (void**)(info->dlpi_addr + jmprel[i].r_offset);
+            *hd->orig_fn = *got;
+            uintptr_t page = (uintptr_t)got & ~(getpagesize() - 1);
+            mprotect((void*)page, getpagesize(), PROT_READ | PROT_WRITE);
+            *got = hd->hook_fn;
+            return 1;
+        }
+    }
+    return 0;
+}
 EGLBoolean hook_eglSwapBuffers(EGLDisplay dpy, EGLSurface surface) {
     static bool init = false;
     EGLint w = 0, h = 0;
@@ -86,7 +125,6 @@ EGLBoolean hook_eglSwapBuffers(EGLDisplay dpy, EGLSurface surface) {
         init = true;
     }
 
-    // Применение игровых модов к движку Unity
     if (get_main) {
         void* cam = get_main();
         if (cam) {
@@ -102,7 +140,7 @@ EGLBoolean hook_eglSwapBuffers(EGLDisplay dpy, EGLSurface surface) {
     }
     if (customFog && set_fog && set_fogColor && set_fogDensity) {
         set_fog(true);
-        Color fc = {fogColor, fogColor, fogColor, fogColor};
+        Color fc = {fogColor[0], fogColor[1], fogColor[2], fogColor[3]};
         set_fogColor(&fc);
         set_fogDensity(fogDensity);
     }
@@ -115,24 +153,22 @@ EGLBoolean hook_eglSwapBuffers(EGLDisplay dpy, EGLSurface surface) {
 
         ImDrawList* bg = ImGui::GetBackgroundDrawList();
 
-        // Цветофильтр экрана
-        if (screenTint > 0.01f) {
-            bg->AddRectFilled(ImVec2(0, 0), ImVec2(w, h), ImGui::ColorConvertFloat4ToU32(ImVec4(screenTint, screenTint, screenTint, screenTint)));
+        if (screenTint[3] > 0.01f) {
+            bg->AddRectFilled(ImVec2(0, 0), ImVec2(w, h), ImGui::ColorConvertFloat4ToU32(ImVec4(screenTint[0], screenTint[1], screenTint[2], screenTint[3])));
         }
 
-        // Отрисовка погоды (дождь / снег / искры)
         if (weatherMode > 0) {
-            for (int i = 0; i < particleCount && i < parts.size(); i++) {
+            for (int i = 0; i < particleCount && i < (int)parts.size(); i++) {
                 auto& p = parts[i];
-                if (weatherMode == 1) { // Дождь
+                if (weatherMode == 1) {
                     p.y += particleSpeed * p.s; p.x -= 2.5f;
                     if (p.y > h) { p.y = -40; p.x = (float)(rand() % (w + 200)); }
                     bg->AddLine(ImVec2(p.x, p.y), ImVec2(p.x - 5, p.y + p.l), IM_COL32(170, 210, 255, 150), 2.0f);
-                } else if (weatherMode == 2) { // Снег
+                } else if (weatherMode == 2) {
                     p.y += particleSpeed * 0.3f * p.s; p.x += sinf(p.y * 0.015f + p.phase) * 1.5f;
                     if (p.y > h) { p.y = -20; p.x = (float)(rand() % w); }
                     bg->AddCircleFilled(ImVec2(p.x, p.y), 4.0f * p.s, IM_COL32(255, 255, 255, 200));
-                } else if (weatherMode == 3) { // Искры
+                } else if (weatherMode == 3) {
                     p.y -= particleSpeed * 0.4f * p.s; p.x += cosf(p.y * 0.02f + p.phase) * 2.0f;
                     if (p.y < -20) { p.y = h + 20; p.x = (float)(rand() % w); }
                     bg->AddCircleFilled(ImVec2(p.x, p.y), 3.5f * p.s, IM_COL32(255, 130, 30, 220));
@@ -141,7 +177,7 @@ EGLBoolean hook_eglSwapBuffers(EGLDisplay dpy, EGLSurface surface) {
         }
 
         if (showFps) {
-            char buf;
+            char buf[64];
             snprintf(buf, sizeof(buf), "NoomiMod | %.0f FPS", io.Framerate);
             bg->AddText(ImVec2(30, 30), IM_COL32(0, 255, 140, 255), buf);
         }
@@ -149,7 +185,6 @@ EGLBoolean hook_eglSwapBuffers(EGLDisplay dpy, EGLSurface surface) {
             bg->AddCircleFilled(ImVec2(w * 0.5f, h * 0.5f), 5.0f, IM_COL32(255, 50, 80, 230));
         }
 
-        // Окно Mod Menu
         ImGui::SetNextWindowSize(ImVec2(660, 580), ImGuiCond_FirstUseEver);
         if (ImGui::Begin("NoomiClone Ultimate Client", &showMenu)) {
             if (ImGui::BeginTabBar("Tabs")) {
@@ -163,7 +198,7 @@ EGLBoolean hook_eglSwapBuffers(EGLDisplay dpy, EGLSurface surface) {
                     if (ImGui::Button("16:9")) aspectRatio = 1.777f;
 
                     ImGui::Separator();
-                    ImGui::Checkbox("Кастом FOV (Угол обзора)", &enableFov);
+                    ImGui::Checkbox("Кастом FOV", &enableFov);
                     ImGui::SliderFloat("Значение FOV", &customFov, 40.0f, 140.0f, "%.0f");
                     ImGui::SliderInt("Лимит FPS", &targetFps, 30, 240);
                     ImGui::Checkbox("Счётчик FPS", &showFps); ImGui::SameLine();
@@ -172,7 +207,7 @@ EGLBoolean hook_eglSwapBuffers(EGLDisplay dpy, EGLSurface surface) {
                 }
 
                 if (ImGui::BeginTabItem("Физика и Паркур")) {
-                    ImGui::SliderFloat("Скорость времени (SlowMo)", &timeScale, 0.15f, 2.5f, "%.2fx");
+                    ImGui::SliderFloat("Скорость времени", &timeScale, 0.15f, 2.5f, "%.2fx");
                     if (ImGui::Button("Слоу-мо 0.4x")) timeScale = 0.4f; ImGui::SameLine();
                     if (ImGui::Button("Норма 1.0x")) timeScale = 1.0f; ImGui::SameLine();
                     if (ImGui::Button("Ускорение 1.6x")) timeScale = 1.6f;
@@ -192,7 +227,7 @@ EGLBoolean hook_eglSwapBuffers(EGLDisplay dpy, EGLSurface surface) {
                     ImGui::SliderFloat("Скорость осадков", &particleSpeed, 4.0f, 35.0f);
 
                     ImGui::Separator();
-                    ImGui::Checkbox("Заменить туман / атмосферу", &customFog);
+                    ImGui::Checkbox("Заменить туман", &customFog);
                     ImGui::ColorEdit3("Цвет атмосферы", fogColor);
                     ImGui::SliderFloat("Плотность тумана", &fogDensity, 0.001f, 0.1f, "%.3f");
                     ImGui::ColorEdit4("Цветофильтр экрана", screenTint);
@@ -206,11 +241,13 @@ EGLBoolean hook_eglSwapBuffers(EGLDisplay dpy, EGLSurface surface) {
         ImGui::Render();
         ImGui_ImplOpenGL3_RenderDrawData(ImGui::GetDrawData());
     }
-    return orig_eglSwapBuffers(dpy, surface);
+    auto orig = (EGLBoolean(*)(EGLDisplay, EGLSurface))orig_eglSwapBuffers_ptr;
+    return orig ? orig(dpy, surface) : EGL_TRUE;
 }
 
 void* hack_thread(void*) {
     while (!dlopen("libil2cpp.so", RTLD_NOLOAD)) sleep(1);
+    while (!dlopen("libunity.so", RTLD_NOLOAD)) sleep(1);
     void* h = dlopen("libil2cpp.so", RTLD_LAZY);
     auto res = (il2cpp_resolve_icall_t)dlsym(h, "il2cpp_resolve_icall");
     if (res) {
@@ -224,8 +261,8 @@ void* hack_thread(void*) {
         set_fogColor = (RenderSettings_set_fogColor_t)res("UnityEngine.RenderSettings::set_fogColor_Injected(UnityEngine.Color&)");
         set_fogDensity = (RenderSettings_set_fogDensity_t)res("UnityEngine.RenderSettings::set_fogDensity(System.Single)");
     }
-    void* egl = dlsym(dlopen("libEGL.so", RTLD_LAZY), "eglSwapBuffers");
-    DobbyHook(egl, (void*)hook_eglSwapBuffers, (void**)&orig_eglSwapBuffers);
+    HookData hd = {"eglSwapBuffers", (void*)hook_eglSwapBuffers, &orig_eglSwapBuffers_ptr};
+    dl_iterate_phdr(phdr_cb, &hd);
     return nullptr;
 }
 
