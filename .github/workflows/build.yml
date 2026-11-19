@@ -7,23 +7,10 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Setup Libraries
+      - name: Download ImGui
         run: |
           HOST="https://github.com"
           git clone --depth 1 "${HOST}/ocornut/imgui.git" jni/imgui
-          git clone --depth 1 "${HOST}/jmpews/Dobby.git" dobby_src
-          cmake -B dobby_build -S dobby_src \
-            -DCMAKE_TOOLCHAIN_FILE=$ANDROID_NDK_HOME/build/cmake/android.toolchain.cmake \
-            -DANDROID_ABI=arm64-v8a \
-            -DANDROID_PLATFORM=android-24 \
-            -DCMAKE_BUILD_TYPE=Release \
-            -DDOBBY_GENERATE_SHARED=OFF \
-            -DDOBBY_BUILD_EXAMPLE=OFF \
-            -DDOBBY_BUILD_TEST=OFF
-          cmake --build dobby_build -j4
-          mkdir -p jni/dobby
-          find dobby_build -name "libdobby.a" -exec cp {} jni/dobby/ \;
-          cp dobby_src/include/dobby.h jni/dobby/
 
       - name: Build .so
         run: |
